@@ -1,0 +1,423 @@
+
+
+
+This is how I use the AHE processing pipeline developed in Breinholt et al 2017. 
+
+See the Dryad package associated with Breinholt et al 2017 for scripts and other directions https://datadryad.org/resource/doi:10.5061/dryad.rf7g5
+
+
+The starting files for this pipeline are:
+
+1) paired raw Illumina reads for each sample
+2)  a text file (i.e. RAWLIST) associating the paired reads with the sample name 
+	
+	RAPiD-Genomics_HM7GKBBXX_UFL_114201_P02_WA01_R1_combo.fastq.gz	RAPiD-Genomics_HM7GKBBXX_UFL_114201_P02_WA01_R2_combo.fastq.gz	Unionidae_Ambleminae_Amblema_plicata
+
+3) Unioverse reference probe regions  (REF)
+	
+
+STEP 1: Trim the Reads using Trim Galore   
+
+	QTRIM_ARRAY.slurm
+	
+
+The trimmed reads will have look like "*_val_*"
+
+
+STEP 2: Assemble the trimmed Illumina reads using Iterative Bait Assembly
+
+Put RAWLIST, trimmed reads, Unioverse reference probe regions (REF), IBA_ASS_SLURM.sh, and IBA.py in a new directory. Put nothing else in there. 
+
+The BLAST parameters in IBA.py script of beinholt were modified for the Unioverse Loci - Be sure to use the Universe ones. The versions of of the modules can effect the assembly
+
+These were the ones used in Pfeiffer et al 2018:
+module load usearch/8.0.1517
+module load python/2.7.6
+module load bridger
+
+	
+	sbatch IBA_ASS_SLURM_PFEIFFER_2
+
+
+Now you should have an "IBAass_*" folder for each sample. In each folder there should be three files
+1)*_finalprobeR.fasta
+2)*_finalseqs.fasta
+3)*_finaltable.table
+
+Step 3: Add References, Alignment, Cut to probe
+
+Concatenate all full length seqeunces
+	cat IBAass_*/*_finalseqs.fasta > ALL_FULL_LOCI.fasta
+
+Convert to single line fasta
+	singleline.pl 		downloaded from http://www.bioinformatics-made-simple.com
+	perl 4_singleline.pl ALL_FULL_LOCI.fasta > sl_ALL_FULL_LOCI.fasta
+	
+Use Countingmonster script to get an appreciation for the abundance and distribution of your reads. The input needs to be single line fastsa file with "_" as delimiters in taxon name
+	
+	python 5_counting_monster.py sl_ALL_FULL_LOCI.fasta _
+	
+
+The output is "tableout.txt" . open it in excel and go look at the last column which counts all the reads - most Unionidae should be above 600. Might inflate expectations a bit because there are multiple versions per loci - you can also use =COUNTIF(B2:AAR2,">0")to get more accurate count.If these are much lower than 600 for the Unionidae then your IBA assembly probably didn't work that well. Try again. Check module versions and BLAST setting.
+	
+
+split sl_ALL_FULL_LOCI.fasta into individual loci files. 
+	python split.py sl_ALL_FULL_LOCI.fasta _
+
+To add the Reference loci data to AHE data you'll need to align the REF loci first. Move align_REF.sh to REF/
+	sbatch 7_align_REF.sh
+
+Move the aligned REF loci (refaa_*) to the folder with the AHE reads (L*.fa) 
+	
+rename *.fa to *.fas
+	for file in *.fa; do mv "$file" "${file%.fa}.fas"; done		
+	
+Add the the AHE files and REF files together using mafft. This can take a couple of hours
+	sbatch 8_addlong.sh	
+			
+Convert all AA_L* files back to single line
+	for X in AA_L* ; do perl 4_singleline.pl $X > sl_$X; done
+
+		
+Make a list of all the fasta files
+	ls sl_AA_L* > list
+	
+Trim probe region and put into one file
+	python 9_extract_probe_region.py list B_platifrons_R outdir
+	
+Go to outdir and concatenate all the *.trimmed files
+	cd outdir
+	cat *.trimmed > 3by3.in
+	
+			
+Remove all "_R_" with "" in 3by3.in
+Remove hyphens from 3by3.in
+Make sure there are no taxa ID that contain "comp" (Change complanata to camplanata and T. comptus to camptus, compress to campressa) - I don't think this step is neccesary but if you do change it be sure you also change it during the usearch grap
+
+
+STEP 4: BLAST, Single Copy, and Orthology
+
+BLAST all the seqs in 3by3.in to the B_platifons genome using a local BLAST DB
+
+Make local BLAST DB
+	download .fna file from genbank for genome of choice
+	module load ncbi_blast/2.6.0
+	makeblastdb -in GCA_002080005.1_Bpl_v1.0_genomic.fna -dbtype nucl -parse_seqids -out B_platifrons		
+
+
+Do BLAST by calling the database(-db) you just made
+	sbatch 10_BLAST_3by3.sh 
+The result of this is 3by3.out
+
+Do Single hit checker
+	python 11_s_hit_checker.py 3by3.out 0.90
+	new IBA files have 3408 seq > 1 hit
+	900 seq in Pseudontini dataset
+	
+Remove the sequences with more than 1 significant hit
+	python 12_removelist.py 3by3.in 3by3_del_list0.90.txt 1by1.in
+
+	
+Take the seq that passed singel hit and re-BLAST
+	sbatch 13_BLAST_1by1.sh 
+	OR blastn -task blastn -query 1by1.in -db B_platifrons -out 1by1.out -outfmt 6 -max_target_seqs 1 -max_hsps 1 -num_threads 8
+The result of this is 1by1.out
+
+Do ortholog filter
+	edit the ortholog_filter.py of breinholt on line 49 from "__" to "_". If you don't do this it will remove almost all seqs. this is just a difference in seq ID naming convention?
+	sbatch 14_ortholog_filter.sh
+	Orthofilter deleted 5081 in all data
+	1126 in Pseudodontini data set
+		
+Grab the seqs that passed the ortholog fliter
+	python 15_getlist.py 1by1.in 1by1_keep_list ORTHO_PASS.fa
+	
+STEP 5: Isofrom consensus
+
+Make into single line fas
+	perl 4_singleline.pl ORTHO_PASS.fa > sl_ORTHO_PASS.fa
+
+Use counting monster to check on your reads - they will be lower but most should still be above 600
+python 5_counting_monster.py sl_ORTHO_PASS.fa _	
+table_3	
+
+Clean up some of the seq names
+	sed -i "s/_/|/g" sl_ORTHO_PASS.fa
+	sed -i "s/|seq/_seq/g" sl_ORTHO_PASS.fa
+
+	
+split it up into loci
+	python 16_split.py sl_ORTHO_PASS.fa \|	
+	
+align the individual loci
+	sbatch 17_align_split_loci.sh
+OR
+	module load mafft/7.245
+	for X in L*.fa; do mafft --thread 8 $X > A_$X; done
+
+Use Fasconcat-G to turn isofroms into consensus seq. Fasconcat-G only excepts files with the extention .fas
+
+to rename .fa to .fas
+	for file in A_*.fa; do mv "$file" "${file%.fa}.fas"; done
+
+move all A_*.fas to a new folder. 
+	mkdir A_loci
+	mv A_*.fas
+		Alldata: 691 loci
+		Psuedodntini: 653
+
+Run fasconcatg
+	perl 18_FASconCAT-G_v1.04.pl -c -c -c -o -s
+	
+concatenate all the loci into one file
+	cat FcC_A* > NOISO_PROBE.fa
+	
+clean up that seq names in that file
+	sed -i "s/|/_/g" NOISO_PROBE.fa
+	sed -i "s/_consensus//" NOISO_PROBE.fa
+	
+
+Use counting monster to check on your reads - they will be lower but most should still be above 500
+	python 5_counting_monster.py NOISO_PROBE.fa _	
+	outtable_4
+
+
+
+Instead of deleteing all the loci that have duplicates, I used this script because it removes the duplicated reads but keeps the read with the greatest depth (I.e comp0)
+
+	python 19_play_for_keeps.py 
+
+Run 20_remove_duplicates.py just get get the right outputs (*.dups/list,*.keep.list, *_single.fas) 
+
+	python 20_remove_duplicates.py output1.txt
+
+no seq should be deleted her because of the previous step
+Total Seqs processed 60009
+Seqs to Keep 60009
+Seqs to delete 0
+% delete 0.0
+
+python 5_counting_monster.py keep.fas _
+table_5
+
+*_keeps.list is a list of the sequences that passed the pipeline.
+
+
+
+########
+get the Full Length Sequences of the sequences that passed the pipeline
+
+Go to one of the initial folders that have the full length sequences and the references and concatenate all of them.
+	cat AA_L*.fas > ALL_FULL_LOCI_w_ref.fa
+
+ALL_FULL_LOCI_w_ref.fa needs to be edited: delete all "_R_" and all the "-", then make it single line.
+	perl 4_singleline.pl ALL_FULL_LOCI_w_ref.fa > ALL_FULL_LOCI_w_ref_sl.fa
+
+Put ALL_FULL_LOCI_w_ref_sl.fa and *_keep.list in a directory with 21_userach.sh. If you have changed the names of any of the taxa (e.g. comp to camp) than be sure to change it in the ALL_FULL_LOCI_w_ref_sl.fas. Again I looks like the usearch version matters - so double check it is the same
+	sbatch 21_usearch.sh
+
+Make single line
+	perl 4_singleline.pl FINAL_FULL_CLEAN.fa > sl_FINAL_FULL_CLEAN.fa
+
+Clean that shiz up	
+	sed -i "s/_/|/g" sl_FINAL_FULL_CLEAN.fa
+	sed -i "s/|seq/_seq/g" sl_FINAL_FULL_CLEAN.fa
+
+Split file into individual loci
+	python 6_split.py sl_FINAL_FULL_CLEAN.fas \|
+
+
+align the final full loci 
+	sbatch 22_MAFFT_loop.sh
+
+
+
+Clean that Shizz up for isofom consensus and convert to single line
+
+
+rename the Final*.fa files to end in .fas
+	for file in *.fa; do mv "$file" "${file%.fa}.fas"; done
+Use FASconCAT-G to create consensus
+	perl 18_FASconCAT-G_v1.04.pl -c -c -c -o -s
+
+Reformat the seq names
+	sed -i "s/|/_/g" FcC_*
+	sed -i -r "s/_+comp.\+//" FcC_*
+	sed -i -r "s/_consensus//" FcC_*
+	
+Now you have the FULL SEQUENCES and they are aligned (FcC_****.fas) - Hooray!
+
+
+#############
+The next steps depend on how you want to build the data set (i.e. the full seq, just the probes, or the flanks too)
+
+h=head
+P=probe region
+t=tail
+
+hhhhhPPPPPPPPPPPPPPPPPPPPPPPPPtttttt = Full sequence
+
+
+##### Extract flanks and Probe
+
+1) Do counting monster to determine what loci to use (I.e. >70 is my go to)
+
+Concatenate
+	cat FcC_Final_L* > all_single.fas
+	
+Convert to single line
+	perl 4_singleline.pl all_single.fas > SL_all_single.fa
+	
+Make sure that "Comp" is not in any of the taxon names. 
+Make sure all taxon names end in __comp
+	python 5_counting_monster.py SL_all_single.fa _
+
+Copy the loci that meet your cut off and make getloci.sh
+	Find L and Replace All with "cp A_L"
+	Find \r and 'Replace All' with ".fas 70/\r" (Make sure last line is done too)
+	Add "#!/bin/bash" to the first line
+	save as Get_Loci.sh
+move to directory with loci
+mkdir in which you name in the script
+	sh Get_Loci.sh
+
+
+2) Pull out taxa of interest - leave in Bplat no matter what 
+
+use the FcC_Final_L*.fas 
+
+need to get rid of "__comp0" in all the taxon names	
+	sed -i "s/__comp0//g" FcC_*
+
+Remove loci name from FcC*
+	sed -i "s/^>L[0-9]\+_/>/" FcC_*
+
+Do get 15_getlist.py
+	for i in FcC_Final_*.fas; do python 15_getlist.py $i Pseudodontini.txt $i.Psuedodontini;done (takes a few minutes)
+
+rename files
+	for file in *.fas.Psuedodontini; do mv "$file" "${file%.fas.Psuedodontini}.Psuedodontini.fas"; done
+  	 
+Realign each loci
+	-sbatch 23_align_simple.sh
+
+
+
+Do Density entropy trimming
+	sbatch 24_alignment_DE_trim.sh
+
+Look at all the pdf files
+Look at al the alignments
+
+Do flank dropper
+	sbatch 24b_flank_dropper.sh
+
+Convert to single line
+	for X in FD22_*; do perl 4_singleline.pl $X > 1l_$X; done
+
+Make a list of these files
+	ls 1l_* > list
+
+Extract the probe
+	python 9_extract_probe_region.py list B_platifrons_R outdir	
+
+
+Move to output directory and rename the files
+	cd outdir
+	for file in *.header; do mv "$file" "${file%.Psuedodontini.fas.header}.header.fas"; done
+	for file in *.tail; do mv "$file" "${file%.Psuedodontini.fas.tail}.tail.fas"; done
+	for file in *.trimmed; do mv "$file" "${file%.Psuedodontini.fas.trimmed}.trimmed.fas"; done
+
+Remove B_platifrons
+	for i in *.fas; do python 15_getlist.py $i Pseudodontini.txt $i.remove_ref;done
+
+Rename files
+	for file in *.header.fas.remove_ref; do mv "$file" "${file%.header.fas.remove_ref}.head.fas"; done
+	for file in *.tail.fas.remove_ref; do mv "$file" "${file%.tail.fas.remove_ref}.tail.fas"; done
+	for file in *.trimmed.fas.remove_ref; do mv "$file" "${file%.trimmed.fas.remove_ref}.probe.fas"; done
+
+Realign all files
+	-sbatch 23_align_simple.sh 
+
+Remove the first 32 characters of file names 
+	for f in A*.fas; do mv "$f" "${f:32}"; done
+
+Remove any sequences that are all gaps
+	for i in *.fas; do python 25_remove_all_gap_seq.py $i $i.f; done
+
+Rename
+	for file in *.fas.f; do mv "$file" "${file%.fas.f}.fas"; done
+
+
+copy files to be respective folders
+	mkdir head
+	mkdir probe
+	mkdir tail
+	cp *.head.fas head/
+	cp *.probe.fas probe/
+	cp *.tail.fas tail/
+
+
+Concatenate all files in respective folders (phylip with partition file)
+	perl 18_FASconCAT-G_v1.04.pl -p -p -a -s -l
+
+
+
+
+
+############
+Extract just the probe region
+
+Concatenate
+	cat FcC_Final_L* > all_single.fas
+	
+Convert to single line
+	perl 4_singleline.pl all_single.fas > SL_all_single.fa
+	
+USe counting_moster.py to export table of gene occupancy. 
+Make sure that "Comp" is not in any of the taxon names. 
+Change ref taxa to end in comp too (find replace "_R\r" to "__comp0\r" 
+	python 5_counting_monster.py SL_all_single.fas _
+
+Remove loci name from FcC*
+	sed -i "s/^>L[0-9]\+_/>/" FcC_*
+
+Make FcC* single line
+	for X in FcC_*; do perl 4_singleline.pl $X > 1l_$X; done
+
+Make a list of all the 1l_FcC*
+	ls 1l_FcC* > list
+
+
+Extract the probes
+	python 9_extract_probe_region.py list B_platifrons_R outdir
+
+Cd to 1_outdir, make directories to put head nd tail files in
+	mkdir head
+	mkdir tail
+	mv *.header head/
+	mv *.tail tail/
+
+Clean up file names
+	for file in *.trimmed; do mv "$file" "${file:13}"; done
+	for file in *.trimmed; do mv "$file" "${file%.fas.trimmed}.fas"; done
+
+
+Now you have all the probe regions - Horay!!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
